@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Ghost Bridge",
+  "version": "1.0.0",
+  "description": "Browser automation bridge",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "scripting",
+    "tabs",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}

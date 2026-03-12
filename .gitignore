@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Config (contains secrets)
+config.yml
+
+# Chrome profile & data
+.browser-agent-profile/
+.ghost-chrome-for-testing/
+.ghost-daemon/
+
+# Scenario logs
+scenarios/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
