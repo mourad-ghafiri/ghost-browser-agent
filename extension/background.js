@@ -1,4 +1,8 @@
 // Ghost Extension Bridge — WebSocket client + command router
+//
+// Paradigm: the agent perceives the page as a numbered list of interactive
+// elements (text outline + matching badges on the screenshot) and acts by
+// index. No CSS selectors, no text matching — language-agnostic by design.
 
 const WS_URL = "ws://127.0.0.1:7331";
 const HEARTBEAT_MS = 20_000;
@@ -103,18 +107,12 @@ async function handleCommand(msg) {
     switch (command) {
       case "navigate":
         return await cmdNavigate(params);
-      case "extract_dom":
-        return await cmdExtractDom();
-      case "click":
-        return await cmdClick(params);
-      case "type":
-        return await cmdType(params);
-      case "select":
-        return await cmdSelect(params);
+      case "observe":
+        return await cmdObserve();
+      case "act_index":
+        return await cmdActIndex(params);
       case "scroll":
         return await cmdScroll(params);
-      case "hover":
-        return await cmdHover(params);
       case "screenshot":
         return await cmdScreenshot();
       case "wait":
@@ -125,14 +123,6 @@ async function handleCommand(msg) {
         return await cmdBack();
       case "forward":
         return await cmdForward();
-      case "double_click":
-        return await cmdDoubleClick(params);
-      case "right_click":
-        return await cmdRightClick(params);
-      case "press_key":
-        return await cmdPressKey(params);
-      case "drag_drop":
-        return await cmdDragDrop(params);
       case "new_tab":
         return await cmdNewTab(params);
       case "switch_tab":
@@ -143,8 +133,6 @@ async function handleCommand(msg) {
         return await cmdGetTabs();
       case "get_url":
         return await cmdGetUrl();
-      case "resolve":
-        return await cmdResolve(params);
       case "zoom":
         return await cmdZoom(params);
       default:
@@ -155,10 +143,733 @@ async function handleCommand(msg) {
   }
 }
 
+// --- Element registry (worker side) ---
+// Built by cmdObserve, consumed by cmdActIndex. Element references live in
+// each frame's ISOLATED world (window.__ghostEls); the worker only keeps the
+// index → frame mapping.
+
+let ghostRegistry = null; // { obsSeq, tabId, map: {gi: {frameId, localIndex}}, labels: {gi: name} }
+let obsSeqCounter = 0;
+
+function clearRegistry() {
+  ghostRegistry = null;
+}
+
+// --- observe: extract + badge + screenshot in ONE round trip ---
+
+async function cmdObserve() {
+  const tab = await getActiveTab();
+  if (!tab) return { error: "no active tab" };
+  const url = tab.url || "";
+  if (!url || url === "about:blank" || url.startsWith("chrome://")
+      || url.startsWith("chrome-extension://") || url.startsWith("about:")) {
+    return { outline: "", image: "", url, title: tab.title || "", error: "internal page" };
+  }
+
+  const obsSeq = ++obsSeqCounter;
+  let results;
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, allFrames: true },
+      world: "ISOLATED",
+      func: observeFrame,
+      args: [obsSeq],
+    });
+  } catch (err) {
+    return { error: err.message };
+  }
+
+  // Top frame (frameId 0) first; drop frames that returned nothing useful
+  const frames = results
+    .filter((r) => r && r.result && (r.result.elements.length || (r.result.outline || "").trim()))
+    .sort((a, b) => (a.frameId === 0 ? -1 : b.frameId === 0 ? 1 : 0));
+  const top = frames.find((f) => f.frameId === 0)?.result || null;
+
+  // Badge offsets: child frame's absolute position = parent offset + its
+  // <iframe> rect in the parent, matched by URL. Ambiguous/unmatched → null
+  // (elements stay usable through the text outline, just unbadged).
+  const offsets = { 0: { x: 0, y: 0 } };
+  let progressed = true;
+  while (progressed) {
+    progressed = false;
+    for (const f of frames) {
+      if (f.frameId in offsets) continue;
+      for (const p of frames) {
+        const po = offsets[p.frameId];
+        if (po === undefined || po === null) continue;
+        const cands = (p.result.iframes || []).filter((ifr) => frameUrlMatch(ifr.url, f.result.url));
+        if (cands.length === 1) {
+          offsets[f.frameId] = { x: po.x + cands[0].rect.x, y: po.y + cands[0].rect.y };
+          progressed = true;
+          break;
+        } else if (cands.length > 1) {
+          offsets[f.frameId] = null;
+          progressed = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // Stitch: global indices, combined outline, registry, badge list
+  const map = {};
+  const labels = {};
+  const badges = [];
+  const sections = [];
+  let offset = 0;
+  let anyTruncated = false;
+  const vpW = top?.scroll?.viewportW || 100000;
+  const vpH = top?.scroll?.viewport || 100000;
+
+  for (const f of frames) {
+    const r = f.result;
+    anyTruncated = anyTruncated || r.truncated;
+    const fo = f.frameId in offsets ? offsets[f.frameId] : null;
+    const renumbered = (r.outline || "").replace(
+      /\[\[(\d+)\]\]/g,
+      (_, n) => `[${offset + Number(n)}]`,
+    );
+    for (const e of r.elements) {
+      const gi = offset + e.i;
+      map[gi] = { frameId: f.frameId, localIndex: e.i };
+      labels[gi] = e.name || e.tag;
+      if (fo && e.rect) {
+        const bx = fo.x + e.rect.x;
+        const by = fo.y + e.rect.y;
+        if (bx > -10 && by > -10 && bx < vpW + 10 && by < vpH + 10) {
+          badges.push({ index: gi, x: bx, y: by });
+        }
+      }
+    }
+    if (f.frameId === 0) {
+      sections.push(renumbered);
+    } else {
+      const note = fo ? "" : " (no badges on screenshot)";
+      sections.push(`--- frame${note}: ${r.url} ---\n${renumbered}`);
+    }
+    offset += r.elements.length;
+  }
+
+  let header = "";
+  if (top) {
+    const s = top.scroll;
+    const pct = s.height <= s.viewport ? 100 : Math.round(((s.top + s.viewport) / s.height) * 100);
+    const hint = pct < 95 ? "more content below" : "near bottom";
+    header = `Page: ${top.title}\nURL: ${top.url}\nScroll: ${pct}% (${hint})\n`
+      + "Interactive elements are numbered [N]; the same numbers appear as red badges on the screenshot.\n\n";
+  }
+  let outline = header + sections.join("\n");
+  if (anyTruncated) {
+    outline += "\n[OUTLINE TRUNCATED — scroll or extract_text to reveal more]";
+  }
+
+  // Set-of-marks screenshot: paint badges, capture, always remove
+  let image = "";
+  try {
+    if (badges.length) await paintBadges(tab.id, badges);
+    image = await captureAndDownscale(tab.windowId);
+  } catch {
+    image = "";
+  } finally {
+    await removeBadges(tab.id);
+  }
+
+  ghostRegistry = { obsSeq, tabId: tab.id, map, labels };
+
+  return {
+    outline,
+    image,
+    url: top?.url || url,
+    title: top?.title || tab.title || "",
+    scroll: top?.scroll || null,
+    labels,
+    elementCount: offset,
+    truncated: anyTruncated,
+    obsSeq,
+  };
+}
+
+function frameUrlMatch(iframeSrc, frameHref) {
+  if (!iframeSrc || !frameHref) return false;
+  if (iframeSrc === frameHref) return true;
+  try {
+    return new URL(iframeSrc, location?.href).origin === new URL(frameHref).origin;
+  } catch {
+    return false;
+  }
+}
+
+async function paintBadges(tabId, badgeList) {
+  await chrome.scripting.executeScript({
+    target: { tabId }, // top frame only — positions are pre-computed absolute
+    world: "ISOLATED",
+    func: (list) => {
+      document.getElementById("__ghost_marks")?.remove(); // clear leftovers
+      const c = document.createElement("div");
+      c.id = "__ghost_marks";
+      c.style.cssText = "position:fixed;inset:0;z-index:2147483646;pointer-events:none;";
+      for (const b of list) {
+        const d = document.createElement("div");
+        d.textContent = b.index;
+        d.style.cssText =
+          `position:absolute;left:${b.x}px;top:${b.y}px;` +
+          "background:#e11;color:#fff;font:bold 11px/1.3 monospace;" +
+          "padding:0 3px;border-radius:3px;transform:translate(-2px,-100%);";
+        c.appendChild(d);
+      }
+      document.documentElement.appendChild(c);
+    },
+    args: [badgeList],
+  });
+}
+
+function removeBadges(tabId) {
+  return chrome.scripting.executeScript({
+    target: { tabId },
+    world: "ISOLATED",
+    func: () => document.getElementById("__ghost_marks")?.remove(),
+  }).catch(() => {});
+}
+
+// Injected into EVERY frame. Fully self-contained (MV3 serialization).
+// Detects interactive elements by BEHAVIOR (not tag), stores live references
+// in this frame's isolated world, and returns a text outline where element
+// text passes through verbatim in whatever language the page uses.
+function observeFrame(obsSeq) {
+  const isTop = window === window.top;
+  const MAX_OUTLINE = isTop ? 20000 : 4000;
+  const MAX_NAME = 80;
+  const MAX_TEXT_LINE = 400;
+  const VP_MARGIN = 50;
+  const vpH = window.innerHeight;
+  const vpW = window.innerWidth;
+
+  const INTERACTIVE_TAGS = new Set(["A", "BUTTON", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"]);
+  const INTERACTIVE_ROLES = new Set([
+    "button", "link", "menuitem", "menuitemcheckbox", "menuitemradio", "option",
+    "tab", "checkbox", "radio", "switch", "combobox", "listbox", "textbox",
+    "searchbox", "slider", "spinbutton", "treeitem",
+  ]);
+  const SKIP_TAGS = new Set([
+    "SCRIPT", "STYLE", "SVG", "NOSCRIPT", "META", "LINK", "TEMPLATE",
+    "OBJECT", "EMBED", "PATH", "DEFS", "CLIPPATH", "BR",
+  ]);
+  const STRUCTURAL = new Set(["BODY", "HTML", "MAIN", "FORM", "HEADER", "FOOTER", "NAV"]);
+
+  const els = [];     // live element refs — index is the local index
+  const meta = [];    // JSON-serializable mirror of els
+  const iframes = [];
+  const lines = [];
+  let outLen = 0;
+  let truncated = false;
+  let textBuf = "";
+
+  function collapse(s) {
+    return (s || "").replace(/\s+/g, " ").trim();
+  }
+
+  function flushText() {
+    let t = collapse(textBuf);
+    textBuf = "";
+    if (!t) return;
+    if (t.length > MAX_TEXT_LINE) t = t.slice(0, MAX_TEXT_LINE) + "…";
+    lines.push(t);
+    outLen += t.length;
+  }
+
+  function inViewport(rect) {
+    if (rect.bottom < -VP_MARGIN || rect.top > vpH + VP_MARGIN) return false;
+    if (rect.right < -VP_MARGIN || rect.left > vpW + VP_MARGIN) return false;
+    if (rect.width <= 0 && rect.height <= 0) return false;
+    return true;
+  }
+
+  function isHardInteractive(el, role) {
+    if (INTERACTIVE_TAGS.has(el.tagName)) return true;
+    if (el.tagName === "LABEL") return true;
+    if (role && INTERACTIVE_ROLES.has(role)) return true;
+    if (el.isContentEditable && el.getAttribute("contenteditable") !== null) return true;
+    return false;
+  }
+
+  function isSoftInteractive(el, style) {
+    if (el.hasAttribute("onclick") || el.hasAttribute("jsaction")) return true;
+    if (el.hasAttribute("tabindex") && el.tabIndex >= 0) return true;
+    if (style.cursor === "pointer") return true;
+    return false;
+  }
+
+  function accName(el) {
+    const aria = el.getAttribute("aria-label");
+    if (aria) return collapse(aria).slice(0, MAX_NAME);
+    const t = collapse(el.innerText);
+    if (t) return t.slice(0, MAX_NAME);
+    return collapse(
+      el.getAttribute("alt") || el.getAttribute("title")
+      || el.getAttribute("placeholder") || el.value || "",
+    ).slice(0, MAX_NAME);
+  }
+
+  function attrStr(el, role) {
+    let s = "";
+    const add = (k, v) => {
+      if (v === null || v === undefined || v === "" || v === false) return;
+      let sv = String(v);
+      if (sv.length > 60) sv = sv.slice(0, 60) + "…";
+      s += ` ${k}=${sv}`;
+    };
+    if (role) add("role", role);
+    add("type", el.getAttribute("type"));
+    add("name", el.getAttribute("name"));
+    add("placeholder", el.getAttribute("placeholder"));
+    if (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT") {
+      add("value", (el.value || "").slice(0, 40));
+    }
+    if (el.checked === true) add("checked", "true");
+    if (el.disabled === true) add("disabled", "true");
+    add("aria-expanded", el.getAttribute("aria-expanded"));
+    add("aria-selected", el.getAttribute("aria-selected"));
+    let href = el.getAttribute("href");
+    if (href) add("href", href.startsWith("data:") ? "[data-uri]" : href);
+    return s;
+  }
+
+  function registerInteractive(el, role) {
+    const idx = els.length;
+    els.push(el);
+    const rect = el.getBoundingClientRect();
+    const tag = el.tagName.toLowerCase();
+    const name = accName(el);
+    meta.push({
+      i: idx,
+      tag,
+      role: role || null,
+      name,
+      rect: {
+        x: Math.round(rect.left), y: Math.round(rect.top),
+        w: Math.round(rect.width), h: Math.round(rect.height),
+      },
+    });
+    const line = `[[${idx}]]<${tag}${attrStr(el, role)}>${name}</${tag}>`;
+    lines.push(line);
+    outLen += line.length;
+  }
+
+  function walk(node, insideInteractive) {
+    if (outLen > MAX_OUTLINE) {
+      truncated = true;
+      return;
+    }
+
+    if (node.nodeType === Node.TEXT_NODE) {
+      if (!insideInteractive) textBuf += " " + node.textContent;
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+    const el = node;
+    const tag = el.tagName;
+    if (SKIP_TAGS.has(tag)) return;
+    if (el.id === "__ghost_overlay" || el.id === "__ghost_marks") return;
+    if (el.getAttribute("aria-hidden") === "true") return;
+
+    let style;
+    try {
+      style = getComputedStyle(el);
+    } catch {
+      return;
+    }
+    if (style.display === "none" || style.visibility === "hidden") return;
+
+    const rect = el.getBoundingClientRect();
+    if (!STRUCTURAL.has(tag) && !inViewport(rect)) return;
+
+    if (tag === "IFRAME") {
+      // Content arrives from the frame's own injection; record position so
+      // the worker can place its badges and label its outline section
+      if (el.src && rect.width > 0 && rect.height > 0) {
+        iframes.push({
+          url: el.src,
+          rect: {
+            x: Math.round(rect.left), y: Math.round(rect.top),
+            w: Math.round(rect.width), h: Math.round(rect.height),
+          },
+        });
+      }
+      return;
+    }
+
+    const role = el.getAttribute("role");
+    const hard = isHardInteractive(el, role);
+    // Soft interactivity (cursor/tabindex/onclick) inherits visually — only
+    // the OUTERMOST soft element registers; hard ones always do
+    const interactive = hard || (!insideInteractive && isSoftInteractive(el, style));
+
+    if (interactive) {
+      flushText();
+      registerInteractive(el, role);
+      // Descend only to find nested hard interactives (text is already
+      // summarized in the element's name)
+      for (const child of (el.shadowRoot || el).childNodes) {
+        walk(child, true);
+      }
+      return;
+    }
+
+    if (insideInteractive) {
+      // Inside an interactive element we only look for nested hard interactives
+      for (const child of (el.shadowRoot || el).childNodes) {
+        walk(child, true);
+      }
+      return;
+    }
+
+    const isBlock = !style.display.startsWith("inline") && style.display !== "contents";
+    if (isBlock) flushText();
+    for (const child of (el.shadowRoot || el).childNodes) {
+      walk(child, false);
+    }
+    if (isBlock) flushText();
+  }
+
+  try {
+    walk(document.body || document.documentElement, false);
+    flushText();
+  } catch {
+    // partial results are fine
+  }
+
+  window.__ghostEls = els;
+  window.__ghostObsSeq = obsSeq;
+
+  return {
+    url: location.href,
+    title: document.title,
+    isTop,
+    scroll: {
+      top: Math.round(window.scrollY),
+      height: Math.round(document.documentElement.scrollHeight),
+      viewport: vpH,
+      viewportW: vpW,
+    },
+    elements: meta,
+    outline: lines.join("\n"),
+    iframes,
+    truncated,
+  };
+}
+
+// --- act by index ---
+
+// Actions that can trigger navigation (executeScript may reject mid-flight)
+// and deserve a settle wait afterwards.
+const NAV_ACTIONS = new Set(["click", "double_click", "press_key", "select", "drag_drop"]);
+
+async function cmdActIndex(params) {
+  const tab = await getActiveTab();
+  const action = params.action;
+  const hasIndex = params.index !== undefined && params.index !== null;
+
+  // Global press_key (no target element) works without a registry
+  if (!(action === "press_key" && !hasIndex)) {
+    if (!ghostRegistry || ghostRegistry.tabId !== tab.id
+        || ghostRegistry.obsSeq !== params.obsSeq) {
+      return { error: "stale observation — page changed, re-observe" };
+    }
+  }
+
+  let frameId = 0;
+  let localIndex = null;
+  let toLocalIndex = null;
+  if (hasIndex) {
+    const m = ghostRegistry.map[params.index];
+    if (!m) return { error: `unknown index ${params.index} — re-observe` };
+    frameId = m.frameId;
+    localIndex = m.localIndex;
+  }
+  if (action === "drag_drop") {
+    const mt = ghostRegistry?.map[params.to_index];
+    if (!mt) return { error: `unknown index ${params.to_index} — re-observe` };
+    if (mt.frameId !== frameId) {
+      return { error: "drag between different frames is not supported" };
+    }
+    toLocalIndex = mt.localIndex;
+  }
+
+  let result;
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, frameIds: [frameId] },
+      world: "ISOLATED",
+      func: actByIndex,
+      args: [action, localIndex, {
+        text: params.text ?? null,
+        value: params.value ?? null,
+        key: params.key ?? null,
+        direction: params.direction ?? null,
+        toLocalIndex,
+      }, params.obsSeq ?? null],
+    });
+    result = r.result;
+  } catch (err) {
+    if (NAV_ACTIONS.has(action)) {
+      // Page navigated away mid-action (form submit, link click) — success
+      result = { ok: true, navigated: true };
+    } else {
+      return { error: err.message };
+    }
+  }
+
+  if (result && result.error) return result;
+  if (NAV_ACTIONS.has(action)) {
+    await waitForPageSettle(tab.id);
+  } else if (action === "hover") {
+    await sleep(200); // let tooltips/dropdowns appear
+  }
+  return result;
+}
+
+// Injected into the element's frame. Self-contained (MV3 serialization).
+function actByIndex(action, localIndex, args, obsSeq) {
+  let el = null;
+  if (localIndex !== null) {
+    if (window.__ghostObsSeq !== obsSeq || !window.__ghostEls) {
+      return { error: "element registry is stale (frame reloaded) — re-observe" };
+    }
+    el = window.__ghostEls[localIndex];
+    if (!el || !el.isConnected) {
+      return { error: "element no longer on page — re-observe" };
+    }
+  }
+
+  function label(node) {
+    if (!node) return "";
+    let t = node.tagName.toLowerCase();
+    if (node.id) t += "#" + node.id;
+    return t;
+  }
+
+  function center(node) {
+    const rect = node.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  }
+
+  // Full pointer/mouse event sequence (critical for SPAs like React/Vue)
+  function mouseSeq(node, mode) {
+    node.scrollIntoView({ block: "center", behavior: "instant" });
+    const { x, y } = center(node);
+    const button = mode === "right" ? 2 : 0;
+    const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y, button };
+    const pe = (type) => node.dispatchEvent(new PointerEvent(type, { ...opts, pointerType: "mouse" }));
+    const me = (type, extra) => node.dispatchEvent(new MouseEvent(type, { ...opts, ...(extra || {}) }));
+    pe("pointerover"); me("mouseover");
+    pe("pointerenter"); me("mouseenter");
+    if (mode === "hover") { pe("pointermove"); me("mousemove"); return; }
+    pe("pointerdown"); me("mousedown");
+    if (mode !== "right") node.focus();
+    pe("pointerup"); me("mouseup");
+    if (mode === "right") { me("contextmenu", { button: 2 }); return; }
+    me("click");
+    if (mode === "double") {
+      pe("pointerdown"); me("mousedown", { detail: 2 });
+      pe("pointerup"); me("mouseup", { detail: 2 });
+      me("click", { detail: 2 });
+      me("dblclick", { detail: 2 });
+    }
+  }
+
+  function typeInto(node, txt, clr) {
+    node.scrollIntoView({ block: "center", behavior: "instant" });
+    node.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+    node.focus();
+    node.dispatchEvent(new FocusEvent("focus", { bubbles: false }));
+
+    if (node.isContentEditable) {
+      if (clr !== false) {
+        document.execCommand("selectAll", false, null);
+        document.execCommand("delete", false, null);
+      }
+      if (!document.execCommand("insertText", false, txt)) {
+        node.textContent = (clr === false ? node.textContent : "") + txt;
+        node.dispatchEvent(new InputEvent("input", { bubbles: true, data: txt, inputType: "insertText" }));
+      }
+      node.dispatchEvent(new Event("change", { bubbles: true }));
+      return;
+    }
+
+    // Native value setter bypasses React's synthetic event system — compute once
+    const nativeSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(node), "value")?.set
+      || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    const setVal = (v) => { if (nativeSetter) nativeSetter.call(node, v); else node.value = v; };
+
+    if (clr !== false) {
+      setVal("");
+      node.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    for (const ch of txt) {
+      // Unicode-safe: `key` carries the character in any script; `code` only
+      // exists for Latin letters/digits and degrades gracefully otherwise
+      const code = /^[a-zA-Z]$/.test(ch) ? "Key" + ch.toUpperCase()
+        : /^[0-9]$/.test(ch) ? "Digit" + ch
+        : "";
+      node.dispatchEvent(new KeyboardEvent("keydown", { key: ch, code, bubbles: true }));
+      node.dispatchEvent(new KeyboardEvent("keypress", { key: ch, code, bubbles: true }));
+      setVal(node.value + ch);
+      node.dispatchEvent(new InputEvent("input", { bubbles: true, data: ch, inputType: "insertText" }));
+      node.dispatchEvent(new KeyboardEvent("keyup", { key: ch, code, bubbles: true }));
+    }
+    node.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  // Language-agnostic: match against the page's own option strings (value or
+  // visible label), never against hardcoded words
+  function selectOption(node, wanted) {
+    node.scrollIntoView({ block: "center", behavior: "instant" });
+    node.focus();
+    const w = String(wanted ?? "");
+    const opts = Array.from(node.options || []);
+    const opt = opts.find((o) => o.value === w)
+      || opts.find((o) => (o.label || o.textContent || "").trim() === w.trim())
+      || opts.find((o) => (o.label || o.textContent || "").trim().toLowerCase() === w.trim().toLowerCase());
+    if (!opt) {
+      const available = opts.slice(0, 20).map((o) => (o.label || o.textContent || "").trim()).join(" | ");
+      return { error: `no option matches "${w}" — options: ${available}` };
+    }
+    const nativeSetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set;
+    if (nativeSetter) nativeSetter.call(node, opt.value); else node.value = opt.value;
+    node.dispatchEvent(new Event("input", { bubbles: true }));
+    node.dispatchEvent(new Event("change", { bubbles: true }));
+    return null;
+  }
+
+  function pressKey(target, k, hasTarget) {
+    const KEY_MAP = {
+      enter: { key: "Enter", code: "Enter", keyCode: 13 },
+      escape: { key: "Escape", code: "Escape", keyCode: 27 },
+      esc: { key: "Escape", code: "Escape", keyCode: 27 },
+      tab: { key: "Tab", code: "Tab", keyCode: 9 },
+      backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
+      delete: { key: "Delete", code: "Delete", keyCode: 46 },
+      space: { key: " ", code: "Space", keyCode: 32 },
+      arrowup: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
+      arrowdown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
+      arrowleft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
+      arrowright: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
+      home: { key: "Home", code: "Home", keyCode: 36 },
+      end: { key: "End", code: "End", keyCode: 35 },
+      pageup: { key: "PageUp", code: "PageUp", keyCode: 33 },
+      pagedown: { key: "PageDown", code: "PageDown", keyCode: 34 },
+    };
+    if (hasTarget) {
+      target.scrollIntoView({ block: "center", behavior: "instant" });
+      target.focus();
+    }
+    const mapped = KEY_MAP[String(k).toLowerCase()]
+      || { key: k, code: /^[a-zA-Z]$/.test(k) ? "Key" + k.toUpperCase() : "", keyCode: String(k).charCodeAt(0) };
+    const opts = {
+      key: mapped.key, code: mapped.code, keyCode: mapped.keyCode,
+      which: mapped.keyCode, bubbles: true, cancelable: true,
+    };
+    target.dispatchEvent(new KeyboardEvent("keydown", opts));
+    target.dispatchEvent(new KeyboardEvent("keypress", opts));
+    target.dispatchEvent(new KeyboardEvent("keyup", opts));
+    if (mapped.key === "Enter" && target.form) {
+      target.form.requestSubmit?.() || target.form.submit();
+    }
+    return { ok: true, target: target.tagName?.toLowerCase() };
+  }
+
+  function dragDrop(from, to) {
+    from.scrollIntoView({ block: "center", behavior: "instant" });
+    const fr = from.getBoundingClientRect();
+    const tr = to.getBoundingClientRect();
+    const fx = fr.left + fr.width / 2, fy = fr.top + fr.height / 2;
+    const tx = tr.left + tr.width / 2, ty = tr.top + tr.height / 2;
+    const dataTransfer = new DataTransfer();
+    const de = (target, type, cx, cy) => target.dispatchEvent(new DragEvent(type, {
+      bubbles: true, cancelable: true, clientX: cx, clientY: cy, dataTransfer,
+    }));
+    from.dispatchEvent(new PointerEvent("pointerdown", {
+      bubbles: true, cancelable: true, clientX: fx, clientY: fy, pointerType: "mouse",
+    }));
+    from.dispatchEvent(new MouseEvent("mousedown", {
+      bubbles: true, cancelable: true, clientX: fx, clientY: fy,
+    }));
+    de(from, "dragstart", fx, fy);
+    de(from, "drag", fx, fy);
+    for (let i = 1; i <= 5; i++) {
+      const cx = fx + (tx - fx) * (i / 5);
+      const cy = fy + (ty - fy) * (i / 5);
+      const over = document.elementFromPoint(cx, cy);
+      if (over) de(over, "dragover", cx, cy);
+    }
+    de(to, "dragenter", tx, ty);
+    de(to, "dragover", tx, ty);
+    de(to, "drop", tx, ty);
+    de(from, "dragend", tx, ty);
+    to.dispatchEvent(new PointerEvent("pointerup", {
+      bubbles: true, cancelable: true, clientX: tx, clientY: ty, pointerType: "mouse",
+    }));
+    to.dispatchEvent(new MouseEvent("mouseup", {
+      bubbles: true, cancelable: true, clientX: tx, clientY: ty,
+    }));
+  }
+
+  switch (action) {
+    case "click":
+      mouseSeq(el, "click");
+      return { ok: true, resolved: label(el), tag: el.tagName.toLowerCase() };
+    case "double_click":
+      mouseSeq(el, "double");
+      return { ok: true, resolved: label(el) };
+    case "right_click":
+      mouseSeq(el, "right");
+      return { ok: true, resolved: label(el) };
+    case "hover":
+      mouseSeq(el, "hover");
+      return { ok: true, resolved: label(el) };
+    case "type":
+      typeInto(el, args.text ?? "", true);
+      return { ok: true, resolved: label(el) };
+    case "select": {
+      const err = selectOption(el, args.value);
+      return err || { ok: true, resolved: label(el) };
+    }
+    case "press_key":
+      return pressKey(el || document.activeElement || document.body, args.key || "Enter", !!el);
+    case "extract_text": {
+      const text = (el.innerText || el.textContent || "").trim();
+      return { ok: true, resolved: label(el), text: text.slice(0, 4000) };
+    }
+    case "scroll": {
+      // Scroll the element's own scrollable container (falls back to page)
+      const scrollable = (n) => n && n.scrollHeight > n.clientHeight + 4
+        && /(auto|scroll|overlay)/.test(getComputedStyle(n).overflowY);
+      let container = el;
+      while (container && !scrollable(container)) container = container.parentElement;
+      if (!container) container = document.scrollingElement || document.documentElement;
+      const amount = (container.clientHeight || window.innerHeight) * 0.7;
+      container.scrollBy({ top: args.direction === "up" ? -amount : amount, behavior: "instant" });
+      return { ok: true, resolved: label(container) };
+    }
+    case "drag_drop": {
+      const to = window.__ghostEls[args.toLocalIndex];
+      if (!to || !to.isConnected) {
+        return { error: "target element no longer on page — re-observe" };
+      }
+      dragDrop(el, to);
+      return { ok: true };
+    }
+    default:
+      return { error: `unknown act action: ${action}` };
+  }
+}
+
 // --- Commands ---
 
 async function cmdNavigate({ url }) {
   const tab = await getActiveTab();
+  clearRegistry();
   await chrome.tabs.update(tab.id, { url });
   // Wait for navigation to complete
   await new Promise((resolve) => {
@@ -175,175 +886,21 @@ async function cmdNavigate({ url }) {
     }, 15_000);
   });
   // Small delay for SPA hydration / dynamic content
-  await sleep(500);
+  await sleep(200);
   injectOverlay(tab.id);
   return { ok: true };
 }
 
-async function cmdExtractDom() {
-  const tab = await getActiveTab();
-  if (!tab || tab.url?.startsWith("chrome://")) {
-    return { html: "", selectorMap: {}, url: tab?.url || "", title: tab?.title || "", scroll: { top: 0, height: 0, viewport: 0 } };
-  }
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: "ISOLATED",
-    func: extractDomFromPage,
-  });
-  return result.result;
-}
-
-async function cmdClick({ selector }) {
+async function cmdScroll({ direction }) {
   const tab = await getActiveTab();
   const [result] = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     world: "ISOLATED",
-    func: (sel) => {
-      const el = document.querySelector(sel);
-      if (!el) return { error: "element not found" };
-
-      // Scroll into view
-      el.scrollIntoView({ block: "center", behavior: "instant" });
-
-      // Get element center for realistic mouse events
-      const rect = el.getBoundingClientRect();
-      const x = rect.left + rect.width / 2;
-      const y = rect.top + rect.height / 2;
-      const eventOpts = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 };
-
-      // Dispatch full mouse event sequence (critical for SPAs like React/Vue/Angular)
-      el.dispatchEvent(new PointerEvent("pointerover", { ...eventOpts, pointerType: "mouse" }));
-      el.dispatchEvent(new MouseEvent("mouseover", eventOpts));
-      el.dispatchEvent(new PointerEvent("pointerenter", { ...eventOpts, pointerType: "mouse" }));
-      el.dispatchEvent(new MouseEvent("mouseenter", eventOpts));
-      el.dispatchEvent(new PointerEvent("pointerdown", { ...eventOpts, pointerType: "mouse" }));
-      el.dispatchEvent(new MouseEvent("mousedown", eventOpts));
-      el.focus();
-      el.dispatchEvent(new PointerEvent("pointerup", { ...eventOpts, pointerType: "mouse" }));
-      el.dispatchEvent(new MouseEvent("mouseup", eventOpts));
-      el.dispatchEvent(new MouseEvent("click", eventOpts));
-
-      // For links, if the SPA prevented default, the native click handles it
-      // For non-links, the event sequence above covers React onClick etc.
-      return { ok: true, tag: el.tagName.toLowerCase() };
-    },
-    args: [selector],
-  });
-  // Wait for SPA route change / dynamic content after click
-  await waitForPageSettle(tab.id);
-  return result.result;
-}
-
-async function cmdType({ selector, text, clear }) {
-  const tab = await getActiveTab();
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: "ISOLATED",
-    func: (sel, txt, clr) => {
-      const el = document.querySelector(sel);
-      if (!el) return { error: "element not found" };
-
-      el.scrollIntoView({ block: "center", behavior: "instant" });
-
-      // Focus with proper event sequence
-      el.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
-      el.focus();
-      el.dispatchEvent(new FocusEvent("focus", { bubbles: false }));
-
-      // Clear existing value
-      if (clr !== false) {
-        // Use native setter to bypass React's synthetic event system
-        const nativeSetter = Object.getOwnPropertyDescriptor(
-          Object.getPrototypeOf(el), "value"
-        )?.set || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-        if (nativeSetter) {
-          nativeSetter.call(el, "");
-        } else {
-          el.value = "";
-        }
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-
-      // Type character by character with proper keyboard events
-      for (const ch of txt) {
-        el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, code: `Key${ch.toUpperCase()}`, bubbles: true }));
-        el.dispatchEvent(new KeyboardEvent("keypress", { key: ch, code: `Key${ch.toUpperCase()}`, bubbles: true }));
-
-        // Use native setter for React compatibility
-        const nativeSetter = Object.getOwnPropertyDescriptor(
-          Object.getPrototypeOf(el), "value"
-        )?.set || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-        if (nativeSetter) {
-          nativeSetter.call(el, el.value + ch);
-        } else {
-          el.value += ch;
-        }
-
-        el.dispatchEvent(new InputEvent("input", { bubbles: true, data: ch, inputType: "insertText" }));
-        el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, code: `Key${ch.toUpperCase()}`, bubbles: true }));
-      }
-
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      return { ok: true };
-    },
-    args: [selector, text, clear],
-  });
-  return result.result;
-}
-
-async function cmdSelect({ selector, value }) {
-  const tab = await getActiveTab();
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: "ISOLATED",
-    func: (sel, val) => {
-      const el = document.querySelector(sel);
-      if (!el) return { error: "element not found" };
-
-      el.scrollIntoView({ block: "center", behavior: "instant" });
-      el.focus();
-
-      // Use native setter for React compatibility
-      const nativeSetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set;
-      if (nativeSetter) {
-        nativeSetter.call(el, val);
-      } else {
-        el.value = val;
-      }
-
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      return { ok: true };
-    },
-    args: [selector, value],
-  });
-  return result.result;
-}
-
-async function cmdScroll({ direction, selector }) {
-  const tab = await getActiveTab();
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: "ISOLATED",
-    func: (dir, sel) => {
-      let target = null;
-      if (sel) {
-        target = document.querySelector(sel);
-      }
-
+    func: (dir) => {
       const amount = window.innerHeight * 0.7;
       const delta = dir === "up" ? -amount : amount;
-
-      if (target) {
-        // Scroll specific element into view
-        target.scrollIntoView({ block: "center", behavior: "smooth" });
-      } else {
-        // Scroll the page — try documentElement, then body, then find scrollable container
-        const scrollable = document.scrollingElement || document.documentElement;
-        scrollable.scrollBy({ top: delta, behavior: "smooth" });
-      }
-
-      // Return new scroll position
+      const scrollable = document.scrollingElement || document.documentElement;
+      scrollable.scrollBy({ top: delta, behavior: "instant" });
       const scrollTop = window.scrollY || document.documentElement.scrollTop;
       const scrollHeight = document.documentElement.scrollHeight;
       const viewport = window.innerHeight;
@@ -355,43 +912,10 @@ async function cmdScroll({ direction, selector }) {
         atBottom: scrollTop + viewport >= scrollHeight - 5,
       };
     },
-    args: [direction, selector || null],
+    args: [direction],
   });
-  // Let smooth scroll complete
-  await sleep(400);
-  return result.result;
-}
-
-async function cmdHover({ selector }) {
-  const tab = await getActiveTab();
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: "ISOLATED",
-    func: (sel) => {
-      const el = document.querySelector(sel);
-      if (!el) return { error: "element not found" };
-
-      el.scrollIntoView({ block: "center", behavior: "instant" });
-
-      const rect = el.getBoundingClientRect();
-      const x = rect.left + rect.width / 2;
-      const y = rect.top + rect.height / 2;
-      const eventOpts = { bubbles: true, cancelable: true, clientX: x, clientY: y };
-
-      // Full hover event sequence
-      el.dispatchEvent(new PointerEvent("pointerover", { ...eventOpts, pointerType: "mouse" }));
-      el.dispatchEvent(new MouseEvent("mouseover", eventOpts));
-      el.dispatchEvent(new PointerEvent("pointerenter", { ...eventOpts, pointerType: "mouse" }));
-      el.dispatchEvent(new MouseEvent("mouseenter", eventOpts));
-      el.dispatchEvent(new PointerEvent("pointermove", { ...eventOpts, pointerType: "mouse" }));
-      el.dispatchEvent(new MouseEvent("mousemove", eventOpts));
-
-      return { ok: true };
-    },
-    args: [selector],
-  });
-  // Wait for hover-triggered content (tooltips, dropdowns)
-  await sleep(500);
+  // Brief pause so lazy-loaded content below the fold can start rendering
+  await sleep(100);
   return result.result;
 }
 
@@ -400,25 +924,45 @@ async function cmdScreenshot() {
   if (!tab) return { error: "no active tab" };
 
   const url = tab.url || "";
-  // Can't capture chrome://, chrome-extension://, about:, or empty pages
-  if (!url || url === "about:blank" || url.startsWith("chrome://") || url.startsWith("chrome-extension://") || url.startsWith("about:")) {
+  if (!url || url === "about:blank" || url.startsWith("chrome://")
+      || url.startsWith("chrome-extension://") || url.startsWith("about:")) {
     return { error: "cannot capture internal/blank pages" };
   }
 
-  // Wait for rendering
-  await sleep(300);
-
   try {
-    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-      format: "jpeg",
-      quality: 60,
-    });
-    const base64 = dataUrl.replace(/^data:image\/\w+;base64,/, "");
-    return { image: base64 };
+    const image = await captureAndDownscale(tab.windowId);
+    return { image };
   } catch (err) {
-    // Gracefully handle permission errors (e.g. activeTab not in effect on some pages)
     return { error: err.message };
   }
+}
+
+// Shared capture pipeline: full retina capture is ~10x bigger than anything
+// the LLM or scenario files need, so downscale in the worker
+async function captureAndDownscale(windowId) {
+  const dataUrl = await chrome.tabs.captureVisibleTab(windowId, {
+    format: "jpeg",
+    quality: 80,
+  });
+  const MAX_W = 1280;
+  const blob = await (await fetch(dataUrl)).blob();
+  const bmp = await createImageBitmap(blob);
+  if (bmp.width <= MAX_W) {
+    bmp.close();
+    return dataUrl.replace(/^data:image\/\w+;base64,/, "");
+  }
+  const scale = MAX_W / bmp.width;
+  const canvas = new OffscreenCanvas(Math.round(bmp.width * scale), Math.round(bmp.height * scale));
+  canvas.getContext("2d").drawImage(bmp, 0, 0, canvas.width, canvas.height);
+  bmp.close();
+  const out = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.7 });
+  const buf = new Uint8Array(await out.arrayBuffer());
+  // Chunked btoa — String.fromCharCode on the whole buffer blows the stack
+  let binary = "";
+  for (let i = 0; i < buf.length; i += 8192) {
+    binary += String.fromCharCode.apply(null, buf.subarray(i, i + 8192));
+  }
+  return btoa(binary);
 }
 
 async function cmdWait({ seconds }) {
@@ -445,251 +989,42 @@ async function cmdEvaluateJs({ code }) {
 }
 
 async function cmdBack() {
-  const tab = await getActiveTab();
-  await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: "ISOLATED",
-    func: () => history.back(),
-  });
-  // Wait for navigation
-  await sleep(1500);
-  return { ok: true };
+  return historyNav("back");
 }
 
 async function cmdForward() {
+  return historyNav("forward");
+}
+
+async function historyNav(direction) {
   const tab = await getActiveTab();
-  await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: "ISOLATED",
-    func: () => history.forward(),
+  clearRegistry();
+  try {
+    if (direction === "back") await chrome.tabs.goBack(tab.id);
+    else await chrome.tabs.goForward(tab.id);
+  } catch {
+    return { ok: true, note: "no further history" };
+  }
+  // Wait for the load to complete instead of a blind sleep
+  await new Promise((resolve) => {
+    const listener = (tabId, info) => {
+      if (tabId === tab.id && info.status === "complete") {
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    }, 5000);
   });
-  await sleep(1500);
+  await waitForPageSettle(tab.id);
   return { ok: true };
 }
 
-async function cmdDoubleClick({ selector }) {
-  const tab = await getActiveTab();
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: "ISOLATED",
-    func: (sel) => {
-      const el = document.querySelector(sel);
-      if (!el) return { error: "element not found" };
-
-      el.scrollIntoView({ block: "center", behavior: "instant" });
-
-      const rect = el.getBoundingClientRect();
-      const x = rect.left + rect.width / 2;
-      const y = rect.top + rect.height / 2;
-      const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 };
-
-      // First click
-      el.dispatchEvent(new PointerEvent("pointerdown", { ...opts, pointerType: "mouse" }));
-      el.dispatchEvent(new MouseEvent("mousedown", opts));
-      el.dispatchEvent(new PointerEvent("pointerup", { ...opts, pointerType: "mouse" }));
-      el.dispatchEvent(new MouseEvent("mouseup", opts));
-      el.dispatchEvent(new MouseEvent("click", opts));
-
-      // Second click (detail: 2 marks it as double-click)
-      el.dispatchEvent(new PointerEvent("pointerdown", { ...opts, pointerType: "mouse" }));
-      el.dispatchEvent(new MouseEvent("mousedown", { ...opts, detail: 2 }));
-      el.dispatchEvent(new PointerEvent("pointerup", { ...opts, pointerType: "mouse" }));
-      el.dispatchEvent(new MouseEvent("mouseup", { ...opts, detail: 2 }));
-      el.dispatchEvent(new MouseEvent("click", { ...opts, detail: 2 }));
-      el.dispatchEvent(new MouseEvent("dblclick", { ...opts, detail: 2 }));
-
-      return { ok: true };
-    },
-    args: [selector],
-  });
-  await waitForPageSettle(tab.id);
-  return result.result;
-}
-
-async function cmdRightClick({ selector }) {
-  const tab = await getActiveTab();
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: "ISOLATED",
-    func: (sel) => {
-      const el = document.querySelector(sel);
-      if (!el) return { error: "element not found" };
-
-      el.scrollIntoView({ block: "center", behavior: "instant" });
-
-      const rect = el.getBoundingClientRect();
-      const x = rect.left + rect.width / 2;
-      const y = rect.top + rect.height / 2;
-      const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 2 };
-
-      el.dispatchEvent(new PointerEvent("pointerdown", { ...opts, pointerType: "mouse" }));
-      el.dispatchEvent(new MouseEvent("mousedown", opts));
-      el.dispatchEvent(new PointerEvent("pointerup", { ...opts, pointerType: "mouse" }));
-      el.dispatchEvent(new MouseEvent("mouseup", opts));
-      el.dispatchEvent(new MouseEvent("contextmenu", { ...opts, button: 2 }));
-
-      return { ok: true };
-    },
-    args: [selector],
-  });
-  await sleep(300);
-  return result.result;
-}
-
-async function cmdPressKey({ key, selector }) {
-  const tab = await getActiveTab();
-  let scriptResult;
-  try {
-    const [result] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      world: "ISOLATED",
-      func: (k, sel) => {
-        // Key name mapping
-        const KEY_MAP = {
-          enter: { key: "Enter", code: "Enter", keyCode: 13 },
-          escape: { key: "Escape", code: "Escape", keyCode: 27 },
-          esc: { key: "Escape", code: "Escape", keyCode: 27 },
-          tab: { key: "Tab", code: "Tab", keyCode: 9 },
-          backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
-          delete: { key: "Delete", code: "Delete", keyCode: 46 },
-          space: { key: " ", code: "Space", keyCode: 32 },
-          arrowup: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
-          arrowdown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
-          arrowleft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
-          arrowright: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
-          home: { key: "Home", code: "Home", keyCode: 36 },
-          end: { key: "End", code: "End", keyCode: 35 },
-          pageup: { key: "PageUp", code: "PageUp", keyCode: 33 },
-          pagedown: { key: "PageDown", code: "PageDown", keyCode: 34 },
-        };
-
-        const target = sel ? document.querySelector(sel) : document.activeElement || document.body;
-        if (sel && !target) return { error: "element not found" };
-
-        if (sel) {
-          target.scrollIntoView({ block: "center", behavior: "instant" });
-          target.focus();
-        }
-
-        const mapped = KEY_MAP[k.toLowerCase()] || { key: k, code: `Key${k.toUpperCase()}`, keyCode: k.charCodeAt(0) };
-
-        const eventOpts = {
-          key: mapped.key,
-          code: mapped.code,
-          keyCode: mapped.keyCode,
-          which: mapped.keyCode,
-          bubbles: true,
-          cancelable: true,
-        };
-
-        target.dispatchEvent(new KeyboardEvent("keydown", eventOpts));
-        target.dispatchEvent(new KeyboardEvent("keypress", eventOpts));
-        target.dispatchEvent(new KeyboardEvent("keyup", eventOpts));
-
-        // For Enter on forms, try to submit
-        if (mapped.key === "Enter" && target.form) {
-          target.form.requestSubmit?.() || target.form.submit();
-        }
-
-        return { ok: true, target: target.tagName?.toLowerCase() };
-      },
-      args: [key, selector || null],
-    });
-    scriptResult = result.result;
-  } catch {
-    // Page likely navigated away due to form submit — that's success
-    scriptResult = { ok: true };
-  }
-  await waitForPageSettle(tab.id);
-  return scriptResult;
-}
-
-async function cmdDragDrop({ fromSelector, toSelector }) {
-  const tab = await getActiveTab();
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: "ISOLATED",
-    func: (fromSel, toSel) => {
-      const from = document.querySelector(fromSel);
-      const to = document.querySelector(toSel);
-      if (!from) return { error: "source element not found" };
-      if (!to) return { error: "target element not found" };
-
-      from.scrollIntoView({ block: "center", behavior: "instant" });
-
-      const fromRect = from.getBoundingClientRect();
-      const toRect = to.getBoundingClientRect();
-      const fromX = fromRect.left + fromRect.width / 2;
-      const fromY = fromRect.top + fromRect.height / 2;
-      const toX = toRect.left + toRect.width / 2;
-      const toY = toRect.top + toRect.height / 2;
-
-      // Create a DataTransfer object
-      const dataTransfer = new DataTransfer();
-
-      // --- Mouse-based drag sequence ---
-      // 1. Pointer/mouse down on source
-      from.dispatchEvent(new PointerEvent("pointerdown", {
-        bubbles: true, cancelable: true, clientX: fromX, clientY: fromY, pointerType: "mouse",
-      }));
-      from.dispatchEvent(new MouseEvent("mousedown", {
-        bubbles: true, cancelable: true, clientX: fromX, clientY: fromY,
-      }));
-
-      // 2. Drag start on source
-      from.dispatchEvent(new DragEvent("dragstart", {
-        bubbles: true, cancelable: true, clientX: fromX, clientY: fromY, dataTransfer,
-      }));
-      from.dispatchEvent(new DragEvent("drag", {
-        bubbles: true, cancelable: true, clientX: fromX, clientY: fromY, dataTransfer,
-      }));
-
-      // 3. Move to target — simulate intermediate mouse moves
-      const steps = 5;
-      for (let i = 1; i <= steps; i++) {
-        const ratio = i / steps;
-        const cx = fromX + (toX - fromX) * ratio;
-        const cy = fromY + (toY - fromY) * ratio;
-        document.elementFromPoint(cx, cy)?.dispatchEvent(new DragEvent("dragover", {
-          bubbles: true, cancelable: true, clientX: cx, clientY: cy, dataTransfer,
-        }));
-      }
-
-      // 4. Enter + over target
-      to.dispatchEvent(new DragEvent("dragenter", {
-        bubbles: true, cancelable: true, clientX: toX, clientY: toY, dataTransfer,
-      }));
-      to.dispatchEvent(new DragEvent("dragover", {
-        bubbles: true, cancelable: true, clientX: toX, clientY: toY, dataTransfer,
-      }));
-
-      // 5. Drop on target
-      to.dispatchEvent(new DragEvent("drop", {
-        bubbles: true, cancelable: true, clientX: toX, clientY: toY, dataTransfer,
-      }));
-
-      // 6. Drag end on source
-      from.dispatchEvent(new DragEvent("dragend", {
-        bubbles: true, cancelable: true, clientX: toX, clientY: toY, dataTransfer,
-      }));
-
-      // 7. Release pointer/mouse
-      to.dispatchEvent(new PointerEvent("pointerup", {
-        bubbles: true, cancelable: true, clientX: toX, clientY: toY, pointerType: "mouse",
-      }));
-      to.dispatchEvent(new MouseEvent("mouseup", {
-        bubbles: true, cancelable: true, clientX: toX, clientY: toY,
-      }));
-
-      return { ok: true };
-    },
-    args: [fromSelector, toSelector],
-  });
-  await sleep(500);
-  return result.result;
-}
-
 async function cmdNewTab({ url }) {
+  clearRegistry();
   const tab = await chrome.tabs.create({ url: url || "about:blank", active: true });
   if (url) {
     // Wait for page load
@@ -706,7 +1041,7 @@ async function cmdNewTab({ url }) {
         resolve();
       }, 15_000);
     });
-    await sleep(500);
+    await sleep(200);
     injectOverlay(tab.id);
   }
   return { ok: true, tabId: tab.id };
@@ -717,8 +1052,9 @@ async function cmdSwitchTab({ index }) {
   if (index < 0 || index >= tabs.length) {
     return { error: `tab index ${index} out of range (0-${tabs.length - 1})` };
   }
+  clearRegistry();
   await chrome.tabs.update(tabs[index].id, { active: true });
-  await sleep(300);
+  await sleep(150);
   const tab = tabs[index];
   return { ok: true, url: tab.url, title: tab.title };
 }
@@ -728,8 +1064,9 @@ async function cmdCloseTab() {
   if (!tab) return { error: "no active tab" };
   const tabs = await chrome.tabs.query({ currentWindow: true });
   if (tabs.length <= 1) return { error: "cannot close the last tab" };
+  clearRegistry();
   await chrome.tabs.remove(tab.id);
-  await sleep(300);
+  await sleep(150);
   return { ok: true };
 }
 
@@ -757,50 +1094,40 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function waitForPageSettle(tabId, timeout = 2000) {
+async function waitForPageSettle(tabId, timeout = 1500) {
   // Wait for SPA content to load after an action:
   // Observe DOM mutations — if DOM is still changing, wait until it stabilizes.
+  // childList-only: watching attributes would let spinners/animations reset
+  // the debounce forever and always burn the hard timeout.
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
       world: "ISOLATED",
       func: (timeoutMs) => {
         return new Promise((resolve) => {
+          const DEBOUNCE = 150; // ms of no mutations = settled
           let timer = null;
-          let settled = false;
+          const finish = () => {
+            observer.disconnect();
+            resolve();
+          };
           const observer = new MutationObserver(() => {
-            // Reset timer on each mutation — DOM is still changing
             if (timer) clearTimeout(timer);
-            timer = setTimeout(() => {
-              settled = true;
-              observer.disconnect();
-              resolve();
-            }, 300); // 300ms of no mutations = settled
+            timer = setTimeout(finish, DEBOUNCE);
           });
           observer.observe(document.body || document.documentElement, {
             childList: true,
             subtree: true,
-            attributes: true,
           });
-          // Start initial timer
-          timer = setTimeout(() => {
-            if (!settled) {
-              observer.disconnect();
-              resolve();
-            }
-          }, 300);
-          // Hard timeout
-          setTimeout(() => {
-            observer.disconnect();
-            resolve();
-          }, timeoutMs);
+          timer = setTimeout(finish, DEBOUNCE);
+          setTimeout(finish, timeoutMs); // hard timeout
         });
       },
       args: [timeout],
     });
   } catch {
     // Page might have navigated away — that's fine
-    await sleep(500);
+    await sleep(300);
   }
 }
 
@@ -809,185 +1136,8 @@ async function cmdZoom({ level }) {
   // level is a percentage: 100 = normal, 200 = 2x, 50 = half
   const factor = (level || 100) / 100;
   await chrome.tabs.setZoom(tab.id, factor);
-  await sleep(300);
+  await sleep(150);
   return { ok: true, zoom: level };
-}
-
-async function cmdResolve({ selector }) {
-  const tab = await getActiveTab();
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: "ISOLATED",
-    func: (sel) => {
-      function tryQ(s) { try { return document.querySelector(s) ? s : null; } catch { return null; } }
-
-      // 1. Exact match
-      if (tryQ(sel)) return { selector: sel };
-
-      // 2. Fix space-separated classes → dot-separated (.foo bar → .foo.bar)
-      const dotFixed = sel.replace(/\.([A-Za-z0-9_-]+)\s+([A-Za-z])/g, ".$1.$2");
-      if (dotFixed !== sel && tryQ(dotFixed)) return { selector: dotFixed };
-
-      // 3. Attribute exact match → starts-with (handles trailing spaces/extra chars)
-      const startsWith = sel.replace(/\[([^\]=*^~|]+)=['"]([^'"]+)['"]\]/g, '[$1^="$2"]');
-      if (startsWith !== sel && tryQ(startsWith)) return { selector: startsWith };
-
-      // 4. Attribute exact match → contains
-      const contains = sel.replace(/\[([^\]=*^~|]+)=['"]([^'"]+)['"]\]/g, '[$1*="$2"]');
-      if (contains !== sel && tryQ(contains)) return { selector: contains };
-
-      // 5. Strip :nth-of-type and retry (LLM sometimes gets index wrong)
-      const noNth = sel.replace(/:nth-of-type\(\d+\)/g, "");
-      if (noNth !== sel && tryQ(noNth)) return { selector: noNth };
-
-      return { error: "element not found" };
-    },
-    args: [selector],
-  });
-  return result.result;
-}
-
-// --- DOM extraction function (injected into pages) ---
-// Returns clean viewport HTML with text truncation
-
-function extractDomFromPage() {
-  const MAX_TEXT = 200;
-  const MAX_HTML = 30000; // chars
-
-  const SKIP_TAGS = new Set([
-    "SCRIPT", "STYLE", "SVG", "NOSCRIPT", "META", "LINK", "TEMPLATE",
-    "IFRAME", "OBJECT", "EMBED", "PATH", "DEFS", "CLIPPATH", "BR",
-  ]);
-  const KEEP_ATTRS = new Set([
-    "id", "class", "href", "src", "type", "name", "placeholder", "value",
-    "role", "aria-label", "aria-expanded", "aria-selected", "aria-checked",
-    "checked", "disabled", "readonly", "for", "action", "method", "alt", "title",
-    "data-testid", "data-test-id", "data-cy", "data-id",
-  ]);
-
-  // --- Build clean HTML (viewport-only) ---
-
-  let htmlSize = 0;
-  const vpH = window.innerHeight;
-  const vpW = window.innerWidth;
-  const VP_MARGIN = 50; // small margin to catch elements near edges
-
-  function isInViewport(el) {
-    try {
-      const rect = el.getBoundingClientRect();
-      // Skip elements completely outside the viewport
-      if (rect.bottom < -VP_MARGIN || rect.top > vpH + VP_MARGIN) return false;
-      if (rect.right < -VP_MARGIN || rect.left > vpW + VP_MARGIN) return false;
-      // Skip zero-size elements
-      if (rect.width <= 0 && rect.height <= 0) return false;
-      return true;
-    } catch {
-      return true; // if we can't check, include it
-    }
-  }
-
-  function isElVisible(el) {
-    const style = getComputedStyle(el);
-    return style.display !== "none" && style.visibility !== "hidden";
-  }
-
-  function escHtml(s) {
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-  }
-
-  function processNode(node) {
-    if (htmlSize > MAX_HTML) return "";
-
-    if (node.nodeType === Node.TEXT_NODE) {
-      let text = node.textContent;
-      text = text.replace(/\s+/g, " ");
-      if (!text.trim()) return "";
-      if (text.length > MAX_TEXT) text = text.substring(0, MAX_TEXT) + "...";
-      htmlSize += text.length;
-      return escHtml(text);
-    }
-
-    if (node.nodeType !== Node.ELEMENT_NODE) return "";
-
-    const el = node;
-    const tag = el.tagName;
-
-    if (SKIP_TAGS.has(tag)) return "";
-    if (el.id === "__ghost_overlay") return "";
-    if (el.getAttribute("aria-hidden") === "true") return "";
-
-    try { if (!isElVisible(el)) return ""; } catch {}
-
-    // Skip elements outside the viewport (only show what's in the screenshot)
-    // Allow BODY/HTML and major structural tags to pass through so the tree stays valid
-    const STRUCTURAL = new Set(["BODY", "HTML", "MAIN", "FORM"]);
-    if (!STRUCTURAL.has(tag) && !isInViewport(el)) return "";
-
-    const tagL = tag.toLowerCase();
-    let attrs = "";
-
-    for (const attr of el.attributes) {
-      if (KEEP_ATTRS.has(attr.name)) {
-        let val = attr.value;
-
-        // Filter obfuscated class names — they confuse the LLM
-        if (attr.name === "class") {
-          const clean = val.split(/\s+/).filter(c => {
-            if (c.length < 2) return false;
-            // Keep classes with separators (nav-link, btn_primary)
-            if (c.includes("-") || c.includes("_")) return true;
-            // Keep all-lowercase classes (header, sidebar, active)
-            if (c === c.toLowerCase() && c.length >= 3) return true;
-            // Drop mixed-case without separators (BLohnc, GYgkab = obfuscated)
-            return false;
-          });
-          if (clean.length === 0) continue; // skip class attr entirely
-          val = clean.join(" ");
-        }
-
-        if (val.length > MAX_TEXT) val = val.substring(0, MAX_TEXT) + "...";
-        attrs += ` ${attr.name}="${escHtml(val)}"`;
-      }
-    }
-
-    if (["INPUT", "IMG", "HR"].includes(tag)) {
-      const html = `<${tagL}${attrs}>`;
-      htmlSize += html.length;
-      return html;
-    }
-
-    let children = "";
-    for (const child of el.childNodes) {
-      children += processNode(child);
-    }
-
-    // Skip empty wrappers, unwrap wrappers with no meaningful attrs
-    const WRAPPER_TAGS = new Set([
-      "DIV", "SPAN", "SECTION", "ARTICLE", "HEADER", "FOOTER",
-      "MAIN", "NAV", "ASIDE", "UL", "OL", "LI", "P", "FIGURE",
-    ]);
-    if (WRAPPER_TAGS.has(tag)) {
-      if (!children.trim()) return "";
-      if (!attrs.trim()) return children;
-    }
-
-    const html = `<${tagL}${attrs}>${children}</${tagL}>`;
-    htmlSize += tagL.length * 2 + 5;
-    return html;
-  }
-
-  const html = processNode(document.body || document.documentElement);
-
-  return {
-    html,
-    url: location.href,
-    title: document.title,
-    scroll: {
-      top: Math.round(window.scrollY),
-      height: Math.round(document.documentElement.scrollHeight),
-      viewport: Math.round(window.innerHeight),
-    },
-  };
 }
 
 // --- Automation overlay — animated blue glow border ---
@@ -1034,8 +1184,12 @@ function injectOverlay(tabId) {
   }).catch(() => {});
 }
 
-// Inject overlay on every page load
+// Inject overlay on every page load; drop the element registry the moment a
+// page starts loading (its element references die with the old document)
 chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status === "loading" && ghostRegistry && ghostRegistry.tabId === tabId) {
+    clearRegistry();
+  }
   if (info.status === "complete") {
     injectOverlay(tabId);
   }

@@ -277,6 +277,12 @@ class BrowserBridge:
         finally:
             self._ws = None
             self._connected.clear()
+            # Fail pending commands immediately instead of letting them
+            # hang until their 30s timeout
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionError("extension disconnected"))
+            self._pending.clear()
 
     async def send_command(self, command: str, params: dict | None = None, timeout: float = 30.0) -> dict:
         """Send a command to the extension and wait for the response."""
@@ -292,7 +298,11 @@ class BrowserBridge:
         if params:
             payload["params"] = params
 
-        await self._ws.send(json.dumps(payload))
+        ws = self._ws
+        if ws is None:
+            self._pending.pop(msg_id, None)
+            raise ConnectionError("extension disconnected")
+        await ws.send(json.dumps(payload))
         try:
             result = await asyncio.wait_for(future, timeout=timeout)
             return result
@@ -304,23 +314,18 @@ class BrowserBridge:
     async def navigate(self, url: str) -> dict:
         return await self.send_command("navigate", {"url": url})
 
-    async def extract_dom(self) -> dict:
-        return await self.send_command("extract_dom")
+    async def observe(self) -> dict:
+        """One round trip: numbered interactive-element outline + set-of-marks
+        screenshot + element registry (indices valid until the page changes)."""
+        return await self.send_command("observe", timeout=20.0)
 
-    async def click(self, selector: str) -> dict:
-        return await self.send_command("click", {"selector": selector})
-
-    async def type_text(self, selector: str, text: str, clear: bool = True) -> dict:
-        return await self.send_command("type", {"selector": selector, "text": text, "clear": clear})
-
-    async def select_option(self, selector: str, value: str) -> dict:
-        return await self.send_command("select", {"selector": selector, "value": value})
+    async def act(self, action: str, params: dict | None = None) -> dict:
+        """Element action addressed by observation index — executed in the
+        element's own frame in a single extension round trip."""
+        return await self.send_command("act_index", {"action": action, **(params or {})})
 
     async def scroll(self, direction: str = "down") -> dict:
         return await self.send_command("scroll", {"direction": direction})
-
-    async def hover(self, selector: str) -> dict:
-        return await self.send_command("hover", {"selector": selector})
 
     async def screenshot(self) -> dict:
         return await self.send_command("screenshot")
@@ -337,21 +342,6 @@ class BrowserBridge:
     async def go_forward(self) -> dict:
         return await self.send_command("forward")
 
-    async def double_click(self, selector: str) -> dict:
-        return await self.send_command("double_click", {"selector": selector})
-
-    async def right_click(self, selector: str) -> dict:
-        return await self.send_command("right_click", {"selector": selector})
-
-    async def press_key(self, key: str, selector: str | None = None) -> dict:
-        params = {"key": key}
-        if selector:
-            params["selector"] = selector
-        return await self.send_command("press_key", params)
-
-    async def drag_drop(self, from_selector: str, to_selector: str) -> dict:
-        return await self.send_command("drag_drop", {"fromSelector": from_selector, "toSelector": to_selector})
-
     async def new_tab(self, url: str | None = None) -> dict:
         return await self.send_command("new_tab", {"url": url or ""})
 
@@ -366,9 +356,6 @@ class BrowserBridge:
 
     async def get_url(self) -> dict:
         return await self.send_command("get_url")
-
-    async def resolve_element(self, selector: str) -> dict:
-        return await self.send_command("resolve", {"selector": selector})
 
     async def zoom(self, level: int = 100) -> dict:
         return await self.send_command("zoom", {"level": level})

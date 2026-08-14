@@ -20,7 +20,7 @@ class LLMConfig:
     model: str = "qwen3.5-27b"
     api_base: str = "http://localhost:1234/v1"
     vision_enabled: bool = True
-    max_tokens: int = 512
+    max_tokens: int = 768
     temperature: float = 0.3
 
 
@@ -66,7 +66,7 @@ def load_config(path: Path | str | None = None) -> Config:
             model=llm.get("model", "qwen3.5-27b"),
             api_base=llm.get("api_base", "http://localhost:1234/v1"),
             vision_enabled=llm.get("vision_enabled", True),
-            max_tokens=llm.get("max_tokens", 512),
+            max_tokens=llm.get("max_tokens", 768),
             temperature=llm.get("temperature", 0.3),
         ),
         browser=BrowserConfig(

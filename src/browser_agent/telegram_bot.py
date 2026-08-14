@@ -318,7 +318,6 @@ class TelegramBot:
                     on_step=self._send_step_update,
                     on_ask_user=self._ask_user,
                     cancel_event=self._cancel_event,
-                    user_queue=self._user_queue,
                 )
 
                 # Send final result

@@ -27,8 +27,8 @@ class Daemon:
         model: str = "qwen3.5-27b",
         api_base: str = "http://localhost:1234/v1",
         vision_enabled: bool = True,
-        temperature: float = 0.7,
-        max_tokens: int = 512,
+        temperature: float = 0.3,
+        max_tokens: int = 768,
     ):
         self.ws_port = ws_port
         self.cmd_port = cmd_port

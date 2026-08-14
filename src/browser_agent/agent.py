@@ -4,18 +4,28 @@ import asyncio
 import base64
 import json
 import os
+import re
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Awaitable
 
-from .ai import AIClient
+from .ai import AIClient, ParseError
 from .browser import Browser, BrowserBridge
-from .dom import DOMState
-from .screenshot import process_screenshot
 
 
-MAX_HISTORY = 10
 SCENARIOS_DIR = Path(__file__).resolve().parent.parent.parent / "scenarios"
+
+# Cheap gate for the CAPTCHA vision probe — the LLM still makes the call,
+# this only decides whether the extra LLM call is worth making at all.
+# Brand/product names only: language-neutral.
+CAPTCHA_RE = re.compile(
+    r"recaptcha|hcaptcha|turnstile|captcha|arkose|funcaptcha|geetest|cf-challenge",
+    re.IGNORECASE,
+)
+
+RECENT_ACTIONS = 8   # executed actions shown to the LLM each step
+MAX_PARSE_FAILURES = 3
 
 # Type for step callback: async fn(step, max_steps, action_text, screenshot_b64)
 StepCallback = Callable[[int, int, str, str], Awaitable[None]]
@@ -33,11 +43,10 @@ async def run_task(
     start_url: str | None = None,
     vision_enabled: bool = True,
     temperature: float = 0.3,
-    max_tokens: int = 512,
+    max_tokens: int = 768,
     on_step: StepCallback | None = None,
     on_ask_user: AskUserCallback | None = None,
     cancel_event: asyncio.Event | None = None,
-    user_queue: asyncio.Queue | None = None,
 ) -> str:
     """Run a single task on an existing browser bridge. Returns the result string."""
     ai = AIClient(
@@ -47,9 +56,16 @@ async def run_task(
         temperature=temperature,
         max_tokens=max_tokens,
     )
-    history: list[dict] = []
+    # Goal-driven state — the LLM's own plan/progress carried between steps,
+    # instead of a replayed transcript of raw actions
+    plan = ""
+    progress = ""
+    notes: list[str] = []          # persistent: user answers — never trimmed
+    hint = ""                      # single overwritable slot: stuck/scroll/parse hints
+    recent: deque = deque(maxlen=RECENT_ACTIONS)  # executed actions, compact
     last_actions: list[str] = []
     scroll_streak = 0  # consecutive steps that are scroll-only
+    parse_failures = 0  # consecutive unparseable LLM responses
     is_zoomed = False  # track CAPTCHA auto-zoom state
 
     # Create scenario folder
@@ -112,21 +128,24 @@ async def run_task(
         step_dir = run_dir / f"step_{step:02d}"
         os.makedirs(step_dir, exist_ok=True)
 
-        # 1. Extract DOM + Screenshot in PARALLEL
+        # 1. Observe — one round trip: numbered outline + badged screenshot
         if _cancelled():
             return _cancel_return(step)
 
-        dom_text, llm_screenshot, full_screenshot = await _observe(bridge)
+        obs = await _observe(bridge)
 
-        # Auto-zoom for CAPTCHAs — ask LLM if it sees a CAPTCHA
-        captcha_detected = await ai.detect_captcha(dom_text, llm_screenshot)
+        # Auto-zoom for CAPTCHAs. The vision probe is an extra LLM call, so
+        # gate it behind a cheap outline check ("or is_zoomed" keeps the
+        # un-zoom decision with the LLM once we're zoomed in).
+        captcha_detected = False
+        if CAPTCHA_RE.search(obs["outline"]) or is_zoomed:
+            captcha_detected = await ai.detect_captcha(obs["outline"], obs["image"])
         if captcha_detected and not is_zoomed:
             print("  CAPTCHA detected — zooming to 200%")
             try:
                 await bridge.zoom(200)
                 await _sleep(0.5)
-                # Re-observe at zoomed level
-                dom_text, llm_screenshot, full_screenshot = await _observe(bridge)
+                obs = await _observe(bridge)  # re-observe at zoomed level
                 is_zoomed = True
             except Exception:
                 pass
@@ -135,22 +154,26 @@ async def run_task(
             try:
                 await bridge.zoom(100)
                 await _sleep(0.3)
-                # Re-observe at normal zoom
-                dom_text, llm_screenshot, full_screenshot = await _observe(bridge)
+                obs = await _observe(bridge)  # re-observe at normal zoom
                 is_zoomed = False
             except Exception:
                 pass
 
-        _save_text(step_dir / "dom.html", dom_text)
-        if full_screenshot:
-            _save_image(step_dir / "screenshot.png", full_screenshot)
+        dom_text = obs["outline"]
+        llm_screenshot = obs["image"]
+        labels = {str(k): v for k, v in obs["labels"].items()}
+        obs_seq = obs["obsSeq"]
 
-        # 2. Ask LLM — returns list of actions (race against cancel event)
+        _save_text(step_dir / "page.txt", dom_text)
+        if llm_screenshot:
+            _save_image(step_dir / "screenshot.jpg", llm_screenshot)
+
+        # 2. Ask LLM — goal-centric context, race against cancel event
         if _cancelled():
             return _cancel_return(step)
-        trimmed = _trim_history(history)
+        context = _build_context(goal, plan, progress, notes, hint, recent, dom_text)
         try:
-            llm_task = asyncio.create_task(ai.step(goal, dom_text, llm_screenshot, trimmed))
+            llm_task = asyncio.create_task(ai.step(context, llm_screenshot))
             if cancel_event:
                 cancel_wait = asyncio.create_task(cancel_event.wait())
                 done_tasks, pending = await asyncio.wait(
@@ -163,22 +186,47 @@ async def run_task(
                     t.add_done_callback(lambda _: None)  # suppress warning
                 if cancel_wait in done_tasks:
                     return _cancel_return(step)
-                actions = llm_task.result()
+                resp = llm_task.result()
             else:
-                actions = await llm_task
+                resp = await llm_task
         except asyncio.CancelledError:
             return _cancel_return(step)
+        except ParseError as e:
+            parse_failures += 1
+            print(f"  Model produced no valid action JSON ({parse_failures}/{MAX_PARSE_FAILURES})")
+            _save_json(step_dir / "error.json", {"phase": "parse", "error": str(e)})
+            if parse_failures >= MAX_PARSE_FAILURES:
+                result = "Aborted: model failed to produce valid actions"
+                _save_json(run_dir / "result.json", {
+                    "result": result, "error": True, "steps": step,
+                    "finished_at": datetime.now().isoformat(),
+                })
+                return result
+            hint = "Your previous reply was not valid JSON. Reply with ONLY the JSON action object."
+            continue
         except Exception as e:
             print(f"  LLM error: {e}")
             _save_json(step_dir / "error.json", {"phase": "llm", "error": str(e)})
             await _sleep(2)
             continue
 
+        parse_failures = 0
+        hint = ""  # the model saw the previous hint; new ones may be set below
+        # Carry plan/progress forward when the model omits them
+        plan = resp["plan"] or plan
+        progress = resp["progress"] or progress
+        actions = resp["actions"]
+        if plan:
+            print(f"  Plan: {plan[:120]}")
+        if progress:
+            print(f"  Progress: {progress[:120]}")
+
         if _cancelled():
             return _cancel_return(step)
 
         # 3. Execute all actions in sequence
         action_texts = []
+        executed_tools: list[str] = []
         for ai_idx, action in enumerate(actions):
             if _cancelled():
                 return _cancel_return(step)
@@ -191,13 +239,14 @@ async def run_task(
                 print(f"  Thinking: {reasoning[:100]}")
             print(f"  Action {ai_idx + 1}/{len(actions)}: {tool_name}({json.dumps(tool_args)})")
 
-            # Check for "done"
+            # Check for "done" — the model declares the goal achieved
             if tool_name == "done":
                 result = tool_args.get("result", "")
                 print(f"\n  Task complete: {result}")
                 _save_json(step_dir / "action.json", {
                     "action": tool_name, "params": tool_args,
                     "reasoning": reasoning, "result": "DONE",
+                    "plan": plan, "progress": progress,
                 })
                 _save_json(run_dir / "result.json", {
                     "result": result, "steps": step,
@@ -206,7 +255,7 @@ async def run_task(
 
                 if on_step:
                     try:
-                        await on_step(step, max_steps, f"✅ Done: {result}", full_screenshot)
+                        await on_step(step, max_steps, f"✅ Done: {result}", llm_screenshot)
                     except Exception:
                         pass
 
@@ -248,10 +297,6 @@ async def run_task(
                 if user_response is None:
                     # User rejected
                     print(f"  User rejected the action")
-                    history.append({
-                        "role": "user",
-                        "content": f"You asked: {question}\nUser REJECTED this action. Task is paused.",
-                    })
                     _save_json(run_dir / "result.json", {
                         "result": "Task paused — user declined",
                         "steps": step,
@@ -259,48 +304,37 @@ async def run_task(
                     })
                     if on_step:
                         try:
-                            await on_step(step, max_steps, "⏸️ Task paused — you declined the action", full_screenshot)
+                            await on_step(step, max_steps, "⏸️ Task paused — you declined the action", llm_screenshot)
                         except Exception:
                             pass
                     return "Task paused — user declined. Browser stays on current page."
 
-                # User provided a response — add to history, re-observe on next step
+                # User provided a response — keep it in persistent notes
                 print(f"  User responded: {user_response[:100]}")
-                history.append({
-                    "role": "user",
-                    "content": f"You asked: {question}\nUser responded: {user_response}",
-                })
+                notes.append(f"User said (re: {question[:60]}): {user_response}")
                 # Break batch — re-observe so LLM can act on user's response
                 break
 
-            # Stuck detection (track recent actions)
-            action_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
-            last_actions.append(action_key)
-            if len(last_actions) > 6:
-                last_actions.pop(0)
-
-            stuck_hint = _detect_stuck(last_actions)
-            if stuck_hint:
-                print(f"  Stuck detected — {stuck_hint[:60]}")
-                history.append({"role": "user", "content": stuck_hint})
-                last_actions.clear()
-                scroll_streak = 0
-
             # Execute action
-            exec_result = await _execute_tool(bridge, tool_name, tool_args)
+            exec_result = await _execute_tool(bridge, tool_name, tool_args, obs_seq)
             print(f"  Result: {json.dumps(exec_result)[:100]}")
 
             _save_json(step_dir / f"action{'_' + str(ai_idx + 1) if len(actions) > 1 else ''}.json", {
                 "action": tool_name, "params": tool_args,
                 "reasoning": reasoning, "result": exec_result,
+                "plan": plan, "progress": progress,
             })
 
-            history.append({
-                "role": "user",
-                "content": f"You performed: {tool_name}({json.dumps(tool_args)}) → Result: {json.dumps(exec_result)[:200]}",
-            })
+            executed_tools.append(tool_name)
+            last_actions.append(f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}")
+            if len(last_actions) > 6:
+                last_actions.pop(0)
+            recent.append(
+                f"{step}. {tool_name}({_compact_args(tool_args)}) → "
+                f"{json.dumps(exec_result)[:120]}"
+            )
 
-            action_texts.append(_friendly_action(tool_name, tool_args))
+            action_texts.append(_friendly_action(tool_name, tool_args, labels))
 
             # If action failed, stop executing remaining actions
             if isinstance(exec_result, dict) and exec_result.get("error"):
@@ -314,40 +348,41 @@ async def run_task(
         if _cancelled():
             return _cancel_return(step)
 
+        # Stuck detection — runs on actions that actually executed; the hint
+        # lands in the single hint slot so the NEXT LLM call sees it
+        stuck_hint = _detect_stuck(last_actions)
+        if stuck_hint:
+            print(f"  Stuck detected — {stuck_hint[:60]}")
+            hint = stuck_hint
+            last_actions.clear()
+            scroll_streak = 0
+
         # Track scroll-only steps — if agent scrolls too many times without
         # clicking/typing/navigating, it's probably lost
-        step_tool_names = [a["tool_name"] for a in actions]
-        is_scroll_only = all(t in ("scroll", "wait") for t in step_tool_names)
-        if is_scroll_only:
+        if executed_tools and all(t in ("scroll", "wait") for t in executed_tools):
             scroll_streak += 1
         else:
             scroll_streak = 0
 
         if scroll_streak >= 4:
             print("  Scroll loop detected — injecting redirect hint")
-            history.append({
-                "role": "user",
-                "content": (
-                    "STOP SCROLLING. You have been scrolling for many steps without "
-                    "taking any meaningful action. You are likely lost on this page. "
-                    "Change your strategy NOW:\n"
-                    "- If you can't find what you need, navigate() directly to a "
-                    "relevant website (e.g. Google Flights, Booking.com, Amazon, etc.)\n"
-                    "- Or go_back() and try a different search query\n"
-                    "- Or click on a visible result instead of scrolling past it"
-                ),
-            })
+            hint = (
+                "STOP SCROLLING. You have been scrolling for many steps without "
+                "taking any meaningful action. Change strategy NOW: navigate() "
+                "directly to a relevant website, go_back() and try a different "
+                "query, or click a visible result instead of scrolling past it."
+            )
             scroll_streak = 0
 
         # Notify step callback ONCE per step with a POST-action screenshot
         if on_step and action_texts:
             step_text = " → ".join(action_texts)
             # Take fresh screenshot showing the result of the actions
-            post_screenshot = full_screenshot  # fallback to pre-action
+            post_screenshot = llm_screenshot  # fallback to pre-action
             try:
                 ss = await asyncio.wait_for(bridge.screenshot(), timeout=5.0)
                 if isinstance(ss, dict) and ss.get("image"):
-                    _, post_screenshot = process_screenshot(ss["image"])
+                    post_screenshot = ss["image"]
             except Exception:
                 pass
             try:
@@ -376,7 +411,7 @@ class Agent:
         port: int = 7331,
         vision_enabled: bool = True,
         temperature: float = 0.3,
-        max_tokens: int = 512,
+        max_tokens: int = 768,
     ):
         self.goal = goal
         self.start_url = url
@@ -421,170 +456,149 @@ def _save_image(path: Path, b64_data: str):
         f.write(base64.b64decode(b64_data))
 
 
-async def _observe(bridge: BrowserBridge) -> tuple[str, str, str]:
-    """Extract DOM and take screenshot in parallel.
+async def _observe(bridge: BrowserBridge) -> dict:
+    """One extension round trip: numbered outline + set-of-marks screenshot.
 
-    Returns (dom_text, llm_screenshot_b64, full_screenshot_b64).
+    Returns a dict with keys: outline, image (b64 JPEG with index badges),
+    labels (index -> short name), obsSeq (staleness token for actions).
     """
-    dom_coro = bridge.extract_dom()
-    ss_coro = asyncio.wait_for(bridge.screenshot(), timeout=5.0)
+    try:
+        obs = await asyncio.wait_for(bridge.observe(), timeout=25.0)
+    except Exception as e:
+        print(f"  Observation failed: {e}")
+        obs = {"error": str(e)}
+    if not isinstance(obs, dict):
+        obs = {"error": "malformed observation"}
 
-    results = await asyncio.gather(dom_coro, ss_coro, return_exceptions=True)
+    if obs.get("error") or not obs.get("outline"):
+        return {
+            "outline": (
+                "Page: (blank or internal page)\n"
+                "This is a blank or internal browser page with no interactive "
+                "content. Use navigate() to go to a website."
+            ),
+            "image": "",
+            "labels": {},
+            "obsSeq": -1,
+        }
 
-    # Process DOM
-    if isinstance(results[0], Exception):
-        print(f"  DOM extraction failed: {results[0]}")
-        dom_text = (
-            "Page: New Tab (blank/internal page)\n"
-            "URL: chrome://newtab\n"
-            "Scroll: 0%\n\n"
-            "This is a blank or internal Chrome page. Navigate to a website to start."
-        )
-    else:
-        dom = DOMState.from_raw(results[0])
-        dom_text = dom.format_for_llm()
-
-    # Process screenshot — small for LLM, full for saving/Telegram
-    llm_b64 = ""
-    full_b64 = ""
-    if isinstance(results[1], Exception):
-        print(f"  Screenshot failed: {results[1]}")
-    elif isinstance(results[1], dict) and "error" in results[1]:
-        print(f"  Screenshot error: {results[1]['error']}")
-    elif isinstance(results[1], dict):
-        llm_b64, full_b64 = process_screenshot(results[1]["image"])
-
-    return dom_text, llm_b64, full_b64
+    obs.setdefault("image", "")
+    obs.setdefault("labels", {})
+    obs.setdefault("obsSeq", -1)
+    return obs
 
 
-# Actions that target a DOM element by selector
+# Element tools → extension act action + tool-arg → act-param mapping.
+# All addressed by observation index; executed in one extension round trip.
 _ELEMENT_ACTIONS = {
-    "click", "type_text", "select_option", "hover",
-    "double_click", "right_click", "extract_text",
+    "click":         ("click",        {"index": "index"}),
+    "double_click":  ("double_click", {"index": "index"}),
+    "right_click":   ("right_click",  {"index": "index"}),
+    "hover":         ("hover",        {"index": "index"}),
+    "extract_text":  ("extract_text", {"index": "index"}),
+    "type_text":     ("type",         {"index": "index", "text": "text"}),
+    "select_option": ("select",       {"index": "index", "value": "value"}),
+    "press_key":     ("press_key",    {"index": "index", "key": "key"}),
+    "drag_drop":     ("drag_drop",    {"from_index": "index", "to_index": "to_index"}),
+}
+
+# Non-element tools → coroutine factory on the bridge
+_BRIDGE_ACTIONS = {
+    "scroll":     lambda b, a: b.scroll(a.get("direction", "down")),
+    "navigate":   lambda b, a: b.navigate(a["url"]),
+    "go_back":    lambda b, a: b.go_back(),
+    "go_forward": lambda b, a: b.go_forward(),
+    "wait":       lambda b, a: b.wait(max(1, min(5, a.get("seconds", 1)))),
+    "new_tab":    lambda b, a: b.new_tab(a.get("url")),
+    "switch_tab": lambda b, a: b.switch_tab(a["index"]),
+    "close_tab":  lambda b, a: b.close_tab(),
+    "list_tabs":  lambda b, a: b.get_tabs(),
+    "zoom":       lambda b, a: b.zoom(a.get("level", 100)),
 }
 
 
-async def _execute_tool(bridge, tool_name: str, args: dict) -> dict:
+def _coerce_indices(params: dict) -> bool:
+    """Indices must be integers; the LLM occasionally sends strings."""
+    for k in ("index", "to_index"):
+        if k in params and params[k] is not None:
+            try:
+                params[k] = int(params[k])
+            except (TypeError, ValueError):
+                return False
+    return True
+
+
+async def _execute_tool(bridge, tool_name: str, args: dict, obs_seq: int) -> dict:
     """Execute a tool action on the browser."""
     try:
-        selector = args.get("selector", "")
+        # scroll with an index scrolls that element's container
+        if tool_name == "scroll" and args.get("index") is not None:
+            params = {
+                "obsSeq": obs_seq,
+                "index": args["index"],
+                "direction": args.get("direction", "down"),
+            }
+            if not _coerce_indices(params):
+                return {"error": "index must be an integer element index"}
+            return await bridge.act("scroll", params)
 
-        # Smart-resolve selector for element-targeting actions
-        if selector and tool_name in _ELEMENT_ACTIONS:
-            resolved = await bridge.resolve_element(selector)
-            if isinstance(resolved, dict) and resolved.get("error"):
-                return resolved
-            if isinstance(resolved, dict) and resolved.get("selector"):
-                selector = resolved["selector"]
+        if tool_name in _ELEMENT_ACTIONS:
+            act_action, param_map = _ELEMENT_ACTIONS[tool_name]
+            params = {"obsSeq": obs_seq}
+            for tool_key, act_key in param_map.items():
+                if tool_key in args:
+                    params[act_key] = args[tool_key]
+            if not _coerce_indices(params):
+                return {"error": "index must be an integer element index"}
+            return await bridge.act(act_action, params)
 
-        if tool_name == "click":
-            return await bridge.click(selector)
+        if tool_name in _BRIDGE_ACTIONS:
+            return await _BRIDGE_ACTIONS[tool_name](bridge, args)
 
-        elif tool_name == "type_text":
-            return await bridge.type_text(selector, args["text"])
-
-        elif tool_name == "select_option":
-            return await bridge.select_option(selector, args["value"])
-
-        elif tool_name == "scroll":
-            return await bridge.scroll(args.get("direction", "down"))
-
-        elif tool_name == "navigate":
-            return await bridge.navigate(args["url"])
-
-        elif tool_name == "go_back":
-            return await bridge.go_back()
-
-        elif tool_name == "wait":
-            seconds = max(1, min(5, args.get("seconds", 1)))
-            return await bridge.wait(seconds)
-
-        elif tool_name == "extract_text":
-            result = await bridge.evaluate_js(
-                f'document.querySelector({json.dumps(selector)})?.innerText || ""'
-            )
-            return result
-
-        elif tool_name == "hover":
-            return await bridge.hover(selector)
-
-        elif tool_name == "double_click":
-            return await bridge.double_click(selector)
-
-        elif tool_name == "right_click":
-            return await bridge.right_click(selector)
-
-        elif tool_name == "press_key":
-            key = args.get("key", "Enter")
-            sel = args.get("selector")
-            # Resolve press_key selector too if present
-            if sel:
-                resolved = await bridge.resolve_element(sel)
-                if isinstance(resolved, dict) and resolved.get("selector"):
-                    sel = resolved["selector"]
-                elif isinstance(resolved, dict) and resolved.get("error"):
-                    return resolved
-            return await bridge.press_key(key, sel)
-
-        elif tool_name == "drag_drop":
-            from_sel = args.get("from_sel", "")
-            to_sel = args.get("to_sel", "")
-            # Resolve both selectors
-            for label, s in [("source", from_sel), ("target", to_sel)]:
-                if s:
-                    r = await bridge.resolve_element(s)
-                    if isinstance(r, dict) and r.get("error"):
-                        return {"error": f"{label} element not found"}
-            r1 = await bridge.resolve_element(from_sel)
-            r2 = await bridge.resolve_element(to_sel)
-            return await bridge.drag_drop(
-                r1.get("selector", from_sel),
-                r2.get("selector", to_sel),
-            )
-
-        elif tool_name == "go_forward":
-            return await bridge.go_forward()
-
-        elif tool_name == "new_tab":
-            return await bridge.new_tab(args.get("url"))
-
-        elif tool_name == "switch_tab":
-            return await bridge.switch_tab(args["index"])
-
-        elif tool_name == "close_tab":
-            return await bridge.close_tab()
-
-        elif tool_name == "list_tabs":
-            return await bridge.get_tabs()
-
-        elif tool_name == "zoom":
-            level = args.get("level", 100)
-            return await bridge.zoom(level)
-
-        else:
-            return {"error": f"Unknown tool: {tool_name}"}
+        # Unknown tool — report back so the LLM can self-correct
+        return {"error": f"Unknown tool: {tool_name}"}
 
     except Exception as e:
         return {"error": str(e)}
 
 
-def _trim_history(history: list[dict]) -> list[dict]:
-    """Keep last MAX_HISTORY entries, summarize older ones."""
-    if len(history) <= MAX_HISTORY:
-        return list(history)
+def _build_context(
+    goal: str,
+    plan: str,
+    progress: str,
+    notes: list[str],
+    hint: str,
+    recent: deque,
+    dom_text: str,
+) -> str:
+    """One goal-centric observation message — replaces transcript history."""
+    lines = [f"GOAL: {goal}", ""]
+    lines.append(f"PLAN: {plan or '(none yet — write one)'}")
+    lines.append(f"PROGRESS: {progress or '(just started)'}")
+    if notes or hint:
+        lines.append("NOTES:")
+        for n in notes:
+            lines.append(f"- {n}")
+        if hint:
+            lines.append(f"- {hint}")
+    if recent:
+        lines.append("RECENT ACTIONS:")
+        for entry in recent:
+            lines.append(f"- {entry}")
+    lines.append("")
+    lines.append(dom_text)
+    return "\n".join(lines)
 
-    older = history[:-MAX_HISTORY]
-    recent = history[-MAX_HISTORY:]
 
-    summary_parts = []
-    for msg in older:
-        content = msg.get("content", "")
-        if isinstance(content, str) and "You performed:" in content:
-            summary_parts.append(content.split("→")[0].strip())
-
-    summary = "Previous actions: " + "; ".join(summary_parts[-5:])
-    return [{"role": "user", "content": summary}] + recent
-
+def _compact_args(args: dict) -> str:
+    """Compact one-line rendering of tool args for the RECENT ACTIONS list."""
+    parts = []
+    for k, v in args.items():
+        s = v if isinstance(v, str) else json.dumps(v)
+        if len(s) > 40:
+            s = s[:37] + "..."
+        parts.append(f"{k}={s!r}" if isinstance(v, str) else f"{k}={s}")
+    return ", ".join(parts)
 
 
 def _detect_stuck(last_actions: list[str]) -> str | None:
@@ -625,33 +639,18 @@ def _detect_stuck(last_actions: list[str]) -> str | None:
     return None
 
 
-def _selector_label(selector: str) -> str:
-    """Turn a CSS selector into a short, human-readable label."""
-    if not selector:
+def _element_label(args: dict, labels: dict, key: str = "index") -> str:
+    """Human-readable name of an element by its observation index."""
+    idx = args.get(key)
+    if idx is None:
         return "element"
-    s = selector.strip()
-    # "#search-btn" → "search-btn"
-    if s.startswith("#"):
-        return s[1:][:30]
-    # "input[name='q']" → "input 'q'"
-    import re as _re
-    attr_m = _re.search(r"\[(?:name|placeholder|aria-label|title|alt)=['\"]([^'\"]{1,30})", s)
-    if attr_m:
-        return f'"{attr_m.group(1)}"'
-    # "a[href='/login']" → "link /login"
-    href_m = _re.search(r"\[href=['\"]([^'\"]{1,40})", s)
-    if href_m:
-        return href_m.group(1)[:30]
-    # Keep it short
-    if len(s) > 35:
-        return s[:32] + "..."
-    return s
+    name = labels.get(str(idx), "")
+    return f'"{name}"' if name else f"[{idx}]"
 
 
-def _friendly_action(tool_name: str, args: dict) -> str:
+def _friendly_action(tool_name: str, args: dict, labels: dict) -> str:
     """Format a tool action as a nice user-friendly description with emojis."""
-    sel = args.get("selector", "")
-    label = _selector_label(sel)
+    label = _element_label(args, labels)
     if tool_name == "click":
         return f"👆 Clicking {label}"
     elif tool_name == "double_click":
@@ -665,7 +664,7 @@ def _friendly_action(tool_name: str, args: dict) -> str:
         return f'⌨️ Typing "{text}" into {label}'
     elif tool_name == "press_key":
         key = args.get("key", "")
-        if sel:
+        if args.get("index") is not None:
             return f"⌨️ Pressing {key} on {label}"
         return f"⌨️ Pressing {key}"
     elif tool_name == "select_option":
@@ -696,7 +695,7 @@ def _friendly_action(tool_name: str, args: dict) -> str:
     elif tool_name == "list_tabs":
         return "📑 Checking open tabs"
     elif tool_name == "drag_drop":
-        return f"🔄 Dragging {_selector_label(args.get('from_sel', ''))} to {_selector_label(args.get('to_sel', ''))}"
+        return f"🔄 Dragging {_element_label(args, labels, 'from_index')} to {_element_label(args, labels, 'to_index')}"
     elif tool_name == "zoom":
         level = args.get("level", 100)
         return f"🔎 Zooming to {level}%"
